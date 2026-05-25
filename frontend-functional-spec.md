@@ -639,6 +639,7 @@ Items that must stay in sync between this spec and the SAD as implementation pro
 - [ ] Deferred items marked [DEFERRED: V1]: Active Chats (CP3), Mobile-responsive layout, RLHF data replay
 - [ ] `POST /api/hitl/checkpoint` payload shape (Section 5.2) confirmed with backend before integration epic — frontend and backend must agree on `checkpoint` enum values and required fields
 - [ ] Scroll-to-bottom gate implementation approach (IntersectionObserver sentinel) reviewed for compatibility with Next.js App Router Server Components boundary — gate logic must run client-side only (use `"use client"` directive in DraftCard)
+- [x] Initial scaffold built by @frontend.eng on 2026-05-20
 
 ---
 
