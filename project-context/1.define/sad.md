@@ -1018,6 +1018,157 @@ The following items are genuinely unresolved and not covered by Decision Log dec
 
 6. **assistant-ui version compatibility**: Which version of assistant-ui supports the inline editor pattern (non-full-screen, embedded in a card component) without requiring a full-page chat layout? This determines the DraftEditor.tsx implementation approach.
 
+> **Status note (2026-05-26)**: Open Question #6 above and four items derived from the Frontend Acceptance Review (2026-05-26) have been resolved in the v1.4 Addendum below. SAD-original Open Questions #1, #2, #4, #5 remain unresolved and are non-blocking for Week 3 Backend.
+
+---
+
+## v1.4 Addendum — Backend Pre-flight Decisions (2026-05-26)
+
+**Context**: Pre-Build Phase 2 (Week 3 Backend) pre-flight resolved four open architectural questions arising from the Frontend Acceptance Review (`~/Downloads/Become an Agentic Architect/Frontend_Acceptance_Review_2026-05-26.md`). These resolutions are binding on the Backend epic and supersede any conflicting interpretations in the SAD v1.3 body.
+
+### A1. CP1 Signal Mechanism — RESOLVED (Option B)
+
+**Question reference**: Frontend Spec Open Q #1; SAD §6 (Data Flow CP1 Gate).
+
+**Resolution**: Extend `RunStatus` shape with two new fields. Pipeline lifecycle status and HITL signal are orthogonal axes — keep them in separate fields, do not overload the `status` enum.
+
+Updated `RunStatus` contract (v1.4):
+
+```typescript
+interface RunStatus {
+  run_id: string;
+  status: "scanning" | "qualifying" | "writing" | "awaiting_cp2" | "done" | "error";
+  current_step: string;
+  progress_pct: number;
+  error_message?: string;
+  // NEW v1.4:
+  cp1_fired: boolean;
+  borderline_jobs: BorderlineJob[];  // empty array when cp1_fired === false
+}
+
+interface BorderlineJob {
+  id: string;
+  title: string;
+  budget_min: number | null;
+  budget_max: number | null;
+  client_score: number;
+  reasoning: string;
+  red_flags: string[];
+  green_flags: string[];
+}
+```
+
+**Rationale**: Clean separation — `status` answers "where is the pipeline?", `cp1_fired` answers "is there a HITL gate active?". Two orthogonal axes. Scales to multiple concurrent HITL gates in V1 (CP3 Chat Engagement).
+
+**Backend implementation note**: Client Qualifier agent writes borderline jobs to a transient buffer (e.g., `pipeline_state.notes` JSONB field). When CrewAI Flow hits `wait()` for CP1, `GET /api/crew/status/{run_id}` serializes the buffer into the response.
+
+**Frontend impact (Integration epic)**: `dashboard/page.tsx` SWR polling effect needs a new branch — when `runStatus.cp1_fired === true && fsmState !== "cp1_pending"`, dispatch `CP1_FIRED` and pass `runStatus.borderline_jobs` to `Cp1Gate` (currently passed as `[]` stub on `dashboard/page.tsx:340`).
+
+### A2. `reviewed_at` Timestamp Storage — RESOLVED (Option B)
+
+**Question reference**: Frontend Spec Open Q #2; SAD §4 (Database Schema).
+
+**Resolution**: Single source of truth in `pipeline_state.notes` JSONB. No column added to `drafts` table.
+
+**Rationale**: Avoid duplicating timestamp sources of truth. Single source preserves the full HITL history (multiple events per draft if user changes their mind), which is required for V1 RLHF replay per Frontend Spec §5.4.
+
+**Backend implementation note**: each `POST /api/hitl/checkpoint` writes a row to `pipeline_state` with `notes` JSONB containing the payload + ISO timestamp. To derive `reviewed_at` for a specific draft:
+
+```sql
+SELECT (notes->>'timestamp')::timestamptz AS reviewed_at
+FROM pipeline_state
+WHERE notes->>'draft_id' = $1
+  AND notes->>'checkpoint' = 'cp2'
+ORDER BY created_at DESC
+LIMIT 1;
+```
+
+**Frontend impact**: None. Frontend does not read `reviewed_at` directly.
+
+### A3. HITL Checkpoint Contract — REAFFIRMED
+
+**Question reference**: Frontend Spec Open Q #5; Frontend Spec §5.2.
+
+**Resolution**: Backend MUST implement `POST /api/hitl/checkpoint` accepting exactly this payload shape:
+
+```typescript
+// HITL Checkpoint Request — v1.4 binding contract
+{
+  checkpoint: "cp1" | "cp2" | "cp2_final",
+  run_id: string,
+  draft_id?: string,        // present for per-draft CP2 events only
+  action: "approve" | "skip" | "complete" | "include" | "exclude",
+  timestamp: string         // ISO 8601
+}
+```
+
+Response shape (success):
+```typescript
+{ success: true, checkpoint: string, recorded_at: string }
+```
+
+**Rationale**: Frontend already POSTs this payload from three call sites (`Cp1Gate.tsx`, `DraftCard.tsx` for approve and skip, `dashboard/page.tsx` for cp2_final). Any backend deviation = silent frontend telemetry loss.
+
+**Backend implementation note**: endpoint writes row to `pipeline_state` (action, run_id, draft_id, payload=notes JSONB) AND releases the corresponding CrewAI Flow `wait()` state matching `(run_id, checkpoint)` tuple.
+
+### A4. assistant-ui Removal — RESOLVED (Option B); Decision D10 Modified
+
+**Question reference**: Frontend Spec Open Q #6; SAD §3 (Frontend Architecture); Decision D10 (Hybrid shadcn + assistant-ui).
+
+**Resolution**: Remove `@assistant-ui/react` dependency entirely. Replace with single-shot Rewrite UX: editable Textarea + "Rewrite with AI" button → modal with rewrite instruction → backend `POST /api/draft-assist` returns one new draft per request.
+
+**Decision D10 Modification (v1.4 supersedes v1.3 D10)**: shadcn/ui used for the full dashboard including `DraftEditor.tsx`. `@assistant-ui/react` removed entirely from MVP. Conversational chat UX deferred to V1.
+
+**Rationale**: Conversational chat editor conflicts with Decision D5 (sub-30-second review path per draft). Proposal editing is transactional ("I know what one thing I want changed"), not exploratory. Single-shot rewrite preserves the fast review flow. Removes ~12 MB unused dependency from frontend bundle.
+
+**Backend implementation note**: new endpoint `POST /api/draft-assist`:
+
+```typescript
+// Request
+{
+  draft_id: string,
+  current_content: string,
+  rewrite_instruction: string,
+  context: {
+    job_title: string,
+    voice_examples_summary: string,
+    portfolio_items_used: string[]
+  }
+}
+
+// Response
+{
+  success: true,
+  rewritten_content: string,
+  generation_metadata: { model: string, tokens_in: number, tokens_out: number }
+}
+```
+
+Model selection: Sonnet 4.5 for `/api/draft-assist` (balance of quality and cost). Opus reserved for the primary Proposal Writer agent only, per cost discipline.
+
+**Frontend impact (Integration epic)**:
+- `package.json`: remove `@assistant-ui/react` dependency
+- `DraftEditor.tsx`: replace Textarea-only fallback with Textarea + "Rewrite with AI" button + modal
+- `lib/api.ts`: add `rewriteDraft()` function calling `/api/draft-assist`
+- `components/draft-rewrite-modal/RewriteModal.tsx`: new component
+
+These frontend changes are deferred to Integration epic (Week 4); current MVP frontend Textarea fallback remains functional in the interim.
+
+---
+
+**Addendum Audit**:
+
+| Field | Value |
+|-------|-------|
+| Timestamp | 2026-05-26 |
+| Resolution session | Cowork (Aigam + Claude) |
+| Trigger artifact | `~/Downloads/Become an Agentic Architect/Frontend_Acceptance_Review_2026-05-26.md` — §3 (Risks for Backend Integration) |
+| Items resolved | 4 (A1 CP1 signal, A2 reviewed_at, A3 HITL contract, A4 assistant-ui) |
+| Items remaining unresolved | SAD-original O.Q. #1, #2, #4, #5 — non-blocking for Week 3 Backend |
+| Modifications to Decisions | D10 (Hybrid shadcn + assistant-ui) → `@assistant-ui/react` removed from MVP; shadcn/ui covers full dashboard |
+| Binding on | Week 3 Backend epic, Week 4 Integration epic |
+| LLM consulted | claude-opus-4-7 (Cowork session reasoning + recommendations) |
+
 ---
 
 ## Audit
