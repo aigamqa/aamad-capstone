@@ -41,18 +41,24 @@
 - Record lifecycle events (task start/stop, retries, guardrail outcomes) in Trace Log.
 - Keep Prompt Trace and Trace Log in project-context artifacts, not inline with generated code.
 - If using step callbacks/event listeners, redact secrets and persist logs under `project-context/2.build/logs`.
+- Enforcement: scaffold log directories at initialization. Both required: (a) commit `.gitkeep` to `project-context/2.build/logs/.gitkeep` so the directory exists in fresh clones; (b) `os.makedirs(log_dir, exist_ok=True)` in crew initialization code as runtime safety. This prevents `FileNotFoundError` on first run.
+
 
 ## Quality Gates
 - Validate required template headings before final artifact write.
 - Use `Task.guardrail` for high-risk outputs (schema limits, content rules, size checks).
 - Require `Task.id` and explicit output path for traceability.
 - For machine-ingested output sections, enforce plain markdown/JSON without code fences.
-- For high-risk outputs, require a human review gate (`human_input=true` or explicit review task).
+- For high-risk outputs, require a human review gate.
+- CRITICAL: Do NOT use native CrewAI `human_input=true` inside tasks. It blocks the CLI/process thread on stdin and causes FastAPI worker timeouts in production deployments without a terminal (e.g., Render.com). All HITL gates MUST be implemented as asynchronous event/state pauses using CrewAI Flows (`Flow.wait()` patterns), released by the frontend via `POST /api/hitl/checkpoint` and pollable by the frontend via `GET /api/crew/status/{run_id}`.
+
 
 ## Failure Policy
 - On missing runtime prerequisites, unresolved tools, heading mismatches, or guardrail failure: halt and write Diagnostic.
 - On context overflow or budget breach: halt and report remediation notes in the artifact.
 
 ## Memory
-- Default memory=False for reproducibility; if memory=True, constrain to current epic, redact secrets, and persist logs to project-context/2.build/logs.
+- Default memory=False for cross-run reproducibility; if memory=True, constrain to current epic, redact secrets, and persist logs to project-context/2.build/logs.
+- Within a single flow run, intermediate context between pipeline steps (e.g., qualified jobs → writer agent) MUST be passed explicitly via `Task.context` chaining. Agents do NOT rely on global memory vectors for within-run handoffs. This applies to single-shot endpoints like `/api/draft-assist` — caller passes the full context (job_title, voice_examples_summary, portfolio_items_used) per request; agent retains nothing between requests.
+
 - If memory=True, set `CREWAI_STORAGE_DIR` to a project-scoped path and record scope/retention in Audit.
