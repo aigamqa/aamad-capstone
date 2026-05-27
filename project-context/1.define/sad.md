@@ -1154,6 +1154,79 @@ Model selection: Sonnet 4.5 for `/api/draft-assist` (balance of quality and cost
 
 These frontend changes are deferred to Integration epic (Week 4); current MVP frontend Textarea fallback remains functional in the interim.
 
+### A5. Additional Backend Contract Hardenings — RESOLVED
+
+**Source**: External QR via Gemini Flash on Frontend Acceptance Review (2026-05-26). Three contractual gaps identified between frontend-side mitigations (already in acceptance review §2.2 and §3) and backend-side enforcement obligations. All three adopted.
+
+#### A5.1. FSM Error Recovery — Structured Error Contract
+
+**Question reference**: Frontend Acceptance Review §2.2 item C (aggressive SWR error dispatch) and §3 risk register.
+
+**Resolution**: `RunStatus` extended with explicit `error_code` enum for classifiable failure modes. Frontend `RUN_ERROR` dispatch must differentiate transient (retryable) from terminal (user-actionable) failures.
+
+Updated `RunStatus` shape (consolidating A1 + A5.1):
+
+```typescript
+interface RunStatus {
+  run_id: string;
+  status: "scanning" | "qualifying" | "writing" | "awaiting_cp2" | "done" | "error";
+  current_step: string;
+  progress_pct: number;
+  error_message?: string;
+  // NEW v1.4:
+  cp1_fired: boolean;
+  borderline_jobs: BorderlineJob[];
+  // NEW v1.4 A5.1:
+  error_code?:
+    | "anthropic_timeout"        // transient — frontend retries with backoff
+    | "anthropic_rate_limit"     // transient — frontend retries after Retry-After
+    | "qualifier_zero_jobs"      // terminal — show "no jobs today" state
+    | "scout_zero_jobs"          // terminal — show "Chrome Extension found nothing"
+    | "voice_examples_missing"   // terminal — onboarding required
+    | "internal_error";          // terminal — show generic error + retry button
+}
+```
+
+**Backend implementation note**: every `status: "error"` write MUST also set `error_code`. Crew Flow `except` handlers map exceptions to enum values before persisting state. No `status: "error"` without code.
+
+**Frontend impact (Integration epic)**: `dashboard/page.tsx` FSM error branch reads `error_code`; transient codes trigger SWR retry-with-backoff instead of immediate `RUN_ERROR` dispatch. Terminal codes render context-specific Card content (not generic "Pipeline error").
+
+#### A5.2. Idempotency Discipline for All Read Endpoints
+
+**Question reference**: Frontend Acceptance Review §3.7 (race condition risk).
+
+**Resolution**: All GET endpoints MUST be strictly idempotent. Polling MUST NOT trigger any LLM call, external API request, or state mutation. Backend reads from `pipeline_state` / `drafts` / `jobs` / `qualified_jobs` tables only.
+
+**Binding contracts**:
+- `GET /api/crew/status/{run_id}` — pure read from `pipeline_state`. MUST NOT restart a stalled crew, MUST NOT retry failed agent calls, MUST NOT re-emit log lines.
+- `GET /api/drafts` and `GET /api/drafts?run_id=X` — pure read from `drafts` table. MUST NOT trigger Writer regeneration.
+- `GET /api/jobs/*` (if exposed) — pure read.
+
+**POST endpoints additional idempotency** (extension beyond Gemini's note): `POST /api/drafts/{id}/{action}` MUST be idempotent on `(draft_id, action)` tuple. If frontend accidentally double-fires Approve, second call returns the same `FeedbackResult` without duplicating clipboard text, HITL telemetry row, or status mutation. Backend dedup via `pipeline_state.notes` lookup before write.
+
+**Rationale**: SWR polls every 3 seconds during running states. A non-idempotent status endpoint that re-triggers crew on each call would generate ~20 spurious Anthropic API calls per minute per user. At Opus rates (~$15/M input, $75/M output) and typical 8k context, this is ~$2-5/minute of waste — catastrophic for Free Tier and unjustifiable cost discipline (Decision D11).
+
+#### A5.3. Sanitized LLM Output Contracts for Array Fields
+
+**Question reference**: AAMAD-core "For machine-ingested output sections, enforce plain markdown/JSON without code fences"; applied to specific frontend-rendered fields.
+
+**Resolution**: Backend MUST enforce strict JSON array shape (no Markdown numbering, bullets, code fences, or wrapping quotes) for all fields rendered by frontend as lists. Enforcement via CrewAI `Task.guardrail` on the producing agent.
+
+**Affected fields**:
+
+| Field | Source agent | Frontend render site |
+|---|---|---|
+| `Draft.edit_suggestions: string[]` | Proposal Writer | DraftCard Alert list |
+| `Draft.portfolio_items_used: string[]` | Proposal Writer (or Portfolio Matcher in V1) | DraftCard Badge row |
+| `QualifiedJob.red_flags: string[]` | Client Qualifier | QualificationBadge tooltip |
+| `QualifiedJob.green_flags: string[]` | Client Qualifier | QualificationBadge tooltip |
+| `BorderlineJob.red_flags: string[]` | Client Qualifier | Cp1Gate item |
+| `BorderlineJob.green_flags: string[]` | Client Qualifier | Cp1Gate item |
+
+**Guardrail spec**: each Writer/Qualifier task must declare a `Task.guardrail` that validates the output array. Reject patterns: leading numbering (`"1. ..."`), leading bullets (`"- ..."`, `"* ..."`), surrounding quotes (`'\"text\"'`), Markdown fences (`"```"`), or empty strings. On guardrail failure: agent retries up to `max_retry_limit` (per Execution baseline controls); on final failure, write Diagnostic and halt run with `error_code: "internal_error"`.
+
+**Rationale**: LLM outputs naturally drift toward Markdown formatting because training data is Markdown-heavy. Without guardrail, Writer may emit `["1. Make opening punchier", "2. Reduce paragraph 2"]` — frontend renders this as a numbered list inside an already-numbered Alert, producing visual nesting bug. Enforcement at backend boundary prevents brittle frontend defensive parsing.
+
 ---
 
 **Addendum Audit**:
@@ -1162,12 +1235,12 @@ These frontend changes are deferred to Integration epic (Week 4); current MVP fr
 |-------|-------|
 | Timestamp | 2026-05-26 |
 | Resolution session | Cowork (Aigam + Claude) |
-| Trigger artifact | `~/Downloads/Become an Agentic Architect/Frontend_Acceptance_Review_2026-05-26.md` — §3 (Risks for Backend Integration) |
-| Items resolved | 4 (A1 CP1 signal, A2 reviewed_at, A3 HITL contract, A4 assistant-ui) |
+| Trigger artifacts | (1) `~/Downloads/Become an Agentic Architect/Frontend_Acceptance_Review_2026-05-26.md` — §3 (Risks for Backend Integration); (2) External QR via Gemini Flash targeted critique on the Frontend Acceptance Review (2026-05-26) |
+| Items resolved | 5 sections — A1 CP1 signal, A2 reviewed_at, A3 HITL contract, A4 assistant-ui, A5 Additional backend hardenings (3 sub-items: A5.1 error_code enum, A5.2 idempotency discipline, A5.3 sanitized array outputs) |
 | Items remaining unresolved | SAD-original O.Q. #1, #2, #4, #5 — non-blocking for Week 3 Backend |
 | Modifications to Decisions | D10 (Hybrid shadcn + assistant-ui) → `@assistant-ui/react` removed from MVP; shadcn/ui covers full dashboard |
 | Binding on | Week 3 Backend epic, Week 4 Integration epic |
-| LLM consulted | claude-opus-4-7 (Cowork session reasoning + recommendations) |
+| LLM consulted | claude-opus-4-7 (Cowork session reasoning + recommendations); Gemini Flash via targeted critique prompt (external QR on Frontend Acceptance Review) |
 
 ---
 
